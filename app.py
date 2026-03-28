@@ -5,6 +5,11 @@
 # ── 1. Environment Setup ─────────────────────────────────────────────────────
 import os
 from dotenv import load_dotenv
+from flask import Flask, request, jsonify, render_template
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)
 
 
 # Single load_dotenv call at the top — adjust path if .env is one level up
@@ -172,37 +177,46 @@ def build_rag_chain(vector_store, llm):
 
 
 # ── 9. Main Pipeline ──────────────────────────────────────────────────────────
-def main():
-    # --- Indexing phase (run once to populate Pinecone) ---
-    print("Loading PDFs...")
-    raw_docs    = load_pdf_files("data")
-    minimal     = filter_to_minimal_docs(raw_docs)
-    chunks      = split_documents(minimal)
-    print(f"  {len(raw_docs)} documents → {len(chunks)} chunks")
+def get_vector_store(pc, embeddings):
+    index = get_or_create_pinecone_index(pc)
+    stats = index.describe_index_stats()
 
-    embeddings  = get_embeddings()
-    print(f"  Embedding dim: {len(embeddings.embed_query('test'))}")
+    if stats['total_vector_count'] > 0:
+        print(f"  Found {stats['total_vector_count']} existing vectors. Skipping upload.")
+        return PineconeVectorStore.from_existing_index(
+            index_name=INDEX_NAME,
+            embedding=embeddings
+        )
+    else:
+        print("  Index empty. Loading and uploading documents...")
+        raw_docs = load_pdf_files("data")
+        minimal  = filter_to_minimal_docs(raw_docs)
+        chunks   = split_documents(minimal)
+        print(f"  {len(raw_docs)} documents → {len(chunks)} chunks")
+        return build_vector_store(chunks, embeddings)
 
-    pc          = Pinecone(api_key=PINECONE_API_KEY)
-    get_or_create_pinecone_index(pc)
+# ── Initialize once at startup ─────────────────────────────────────────────
+print("Initializing pipeline...")
+embeddings   = get_embeddings()
+pc           = Pinecone(api_key=PINECONE_API_KEY)
+vector_store = get_vector_store(pc, embeddings)
+llm          = get_llm()
+chain        = build_rag_chain(vector_store, llm)
+print("Ready!")
 
-    print("Uploading chunks to Pinecone...")
-    vector_store = build_vector_store(chunks, embeddings)
+# ── Flask routes ───────────────────────────────────────────────────────────
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-    # --- Query phase ---
-  # --- Query phase ---
-    llm   = get_llm()
-    chain = build_rag_chain(vector_store, llm)
+@app.route('/chat', methods=['POST'])
+def chat():
+    data  = request.get_json()
+    query = data.get('query', '').strip()
+    if not query:
+        return jsonify({"error": "Empty query"}), 400
+    result = chain.invoke(query)
+    return jsonify({"answer": result, "sources": []})
 
-    print("\nMedical Chatbot ready. Type 'exit' to quit.\n")
-    while True:
-        query = input("You: ").strip()
-        if query.lower() in ("exit", "quit"):
-            break
-        if not query:
-            continue
-        result = chain.invoke(query)
-        print(f"\nBot: {result}\n")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    app.run(debug=False, port=5000)
